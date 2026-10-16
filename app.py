@@ -1,32 +1,63 @@
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Response
 from pydantic import BaseModel
 from typing import List, Optional
+import hmac
+import logging
+import os
 import uvicorn
 from recommender import Recommender
 
 app = FastAPI()
 
-API_KEY = "carshowcase_internal_2026"
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("recommendation-service")
+
+# The shared secret must come from the environment. It used to be a literal in this
+# file, so it was in the repository and in every clone, and it could not be rotated
+# without a code change. Refuse to start rather than fall back to a published value.
+MIN_KEY_LENGTH = 32
+API_KEY = os.environ.get("ML_SERVICE_KEY", "").strip()
+if len(API_KEY) < MIN_KEY_LENGTH:
+    raise SystemExit(
+        "ML_SERVICE_KEY is missing or shorter than {} characters. Generate one with "
+        "'openssl rand -base64 32' and set it on both this service and the API, which "
+        "sends it as the X-ML-KEY header.".format(MIN_KEY_LENGTH)
+    )
+
 recommender = None
+recommender_error = None
 
 
 @app.on_event("startup")
 def startup_event():
-    global recommender
+    global recommender, recommender_error
     try:
         recommender = Recommender()
+        recommender_error = None
     except Exception as e:
-        print(f"Failed to initialize recommender: {e}")
+        # Staying up lets the service report why it is broken instead of crash-looping,
+        # but it must not claim to be healthy while every endpoint answers 503.
+        recommender_error = str(e)
+        log.exception("Failed to initialize recommender")
 
 
 async def verify_key(x_ml_key: str = Header(None)):
-    if x_ml_key != API_KEY:
+    if not hmac.compare_digest(x_ml_key or "", API_KEY):
         raise HTTPException(status_code=403, detail="Unauthorized")
     return x_ml_key
 
 
 @app.get("/health")
-def health_check():
+def health_check(response: Response):
+    # Previously always 200, so a service whose model failed to load looked healthy
+    # to every monitor while answering 503 to all of its real endpoints.
+    if recommender is None:
+        response.status_code = 503
+        return {
+            "status": "unavailable",
+            "service": "car-recommendation-service",
+            "reason": "recommender not initialized",
+        }
     return {"status": "ok", "service": "car-recommendation-service"}
 
 
